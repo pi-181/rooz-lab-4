@@ -8,23 +8,37 @@ using namespace cv;
 using namespace std;
 
 const cv::String picPath = R"(pics\hot-charcoal.jpg)";
-const cv::String bookPath = R"(pics\book.jpg)";
+const cv::String bookPath = R"(pics\book.png)";
+const cv::String img1Path = R"(pics\1.png)";
+const cv::String img2Path = R"(pics\2.png)";
 
-template<typename T, int N>
-class IntegralImage {
-    cv::Mat integralImage;
-public:
-    IntegralImage(cv::Mat image) {
-        cv::integral(image, integralImage,
-                     cv::DataType<T>::type);
-    }
+void integralThreshold(const Mat iimage, Mat binary, int blockSize = 21, int threshold = 10) {
+    int halfSize = blockSize / 2;
+    int nl = iimage.rows;
+    int nc = iimage.cols * iimage.channels();
 
-    cv::Vec<T, N> operator()(int xo, int yo, int width, int height) {
-        return (integralImage.at<cv::Vec<T, N>>(yo + height, xo + width) -
-                integralImage.at<cv::Vec<T, N>>(yo + height, xo) - integralImage.at<cv::Vec<T, N>>(yo, xo + width) +
-                integralImage.at<cv::Vec<T, N>>(yo, xo));
+    for (int j = halfSize; j < nl - halfSize - 1; j++) {
+
+        auto *data = binary.ptr<uchar>(j);
+        const int *idata1 = iimage.ptr<int>(j - halfSize);
+        const int *idata2 = iimage.ptr<int>(j + halfSize + 1);
+
+        // Для кожного пікселя рядка
+        for (int i = halfSize; i < nc - halfSize - 1; i++) {
+
+            // Обчислювальна сума
+            int sum = (idata2[i + halfSize + 1] - idata2[i - halfSize] -
+                       idata1[i + halfSize + 1] + idata1[i - halfSize])
+                      / (blockSize * blockSize);
+
+            // адаптивний поріг
+            if (data[i] < (sum - threshold))
+                data[i] = 0;
+            else
+                data[i] = 255;
+        }
     }
-};
+}
 
 class ContentFinder {
 private:
@@ -33,16 +47,25 @@ private:
     int channels[3];
     float threshold;
     cv::Mat histogram;
+    cv::SparseMat shistogram;
+    bool sparse;
 public:
-    ContentFinder() : threshold(0.1f) {
+    ContentFinder() : threshold(0.1f), sparse(false) {
         ranges[0] = hranges;
         ranges[1] = hranges;
         ranges[2] = hranges;
     }
 
     void setHistogram(const cv::Mat &h) {
+        sparse = false;
         histogram = h;
         cv::normalize(histogram, histogram, 1.0);
+    }
+
+    void setHistogram(const cv::SparseMat &h) {
+        sparse = true;
+        shistogram = h;
+        cv::normalize(shistogram, shistogram, 1.0, NORM_L2);
     }
 
     void setThreshold(float _threshold) {
@@ -59,6 +82,7 @@ public:
         return find(image, hranges[0], hranges[1], channels);
     }
 
+
     cv::Mat find(const cv::Mat &image, float minValue, float maxValue, int *channels) {
         cv::Mat result;
         hranges[0] = minValue;
@@ -68,7 +92,11 @@ public:
             this->channels[i] = channels[i];
         }
 
-        cv::calcBackProject(&image, 1, channels, histogram, result, ranges, 55.0);
+        if (sparse) {
+            cv::calcBackProject(&image, 1, channels, shistogram, result, ranges, 255.0);
+        } else {
+            cv::calcBackProject(&image, 1, channels, histogram, result, ranges, 255.0);
+        }
 
         if (threshold > 0.0) {
             cv::threshold(result, result, 255.0 * threshold, 255.0, cv::THRESH_BINARY);
@@ -105,8 +133,61 @@ public:
     }
 
     cv::Mat getHistogram(const cv::Mat &image) {
+        hranges[0] = 0.0;
+        hranges[1] = 256.0;
+        channels[0] = 0;
+        channels[1] = 1;
+        channels[2] = 2;
+
         cv::Mat hist;
         cv::calcHist(&image, 1, channels, cv::Mat(), hist, 3, histSize, ranges);
+        return hist;
+    }
+
+    cv::SparseMat getSparseHistogram(const cv::Mat &image) {
+        hranges[0] = 0.0;
+        hranges[1] = 256.0;
+        channels[0] = 0;
+        channels[1] = 1;
+        channels[2] = 2;
+
+        cv::SparseMat hist(3, histSize, CV_32F);
+        cv::calcHist(&image, 1, channels, cv::Mat(), hist, 3, histSize, ranges);
+        return hist;
+    }
+
+    cv::Mat getHueHistogram(const cv::Mat &image, int minSaturation = 0) {
+        cv::Mat hist;
+
+        cv::Mat hsv;
+        cv::cvtColor(image, hsv, cv::COLOR_BGR2HSV);
+
+        cv::Mat mask;
+
+        if (minSaturation > 0) {
+            // Spliting the 3 channels into 3 images
+            std::vector<cv::Mat> v;
+            cv::split(hsv, v);
+            // Mask out the low saturated pixels
+            cv::threshold(v[1], mask, minSaturation, 255, cv::THRESH_BINARY);
+        }
+
+        // Prepare arguments for a 1D hue histogram
+        hranges[0] = 0.0;
+        hranges[1] = 180.0;
+        channels[0] = 0; // the hue channel
+
+        // Compute histogram
+        cv::calcHist(&hsv,
+                     1,        // histogram of 1 image only
+                     channels, // the channel used
+                     mask,     // no mask is used
+                     hist,     // the resulting histogram
+                     1,        // it is a 1D histogram
+                     histSize, // number of bins
+                     ranges    // pixel value range
+        );
+
         return hist;
     }
 
@@ -178,15 +259,74 @@ public:
     }
 };
 
+class ImageComparator {
+private:
+    cv::Mat refH;
+    cv::Mat inputH;
+    ColorHistogram hist;
+    int nBins;
+public:
+    ImageComparator() : nBins(8) {
+    }
+
+    void setReferenceImage(const cv::Mat &image) {
+        hist.setSize(nBins);
+        refH = hist.getHistogram(image);
+    }
+
+    double compare(const cv::Mat &image) {
+        inputH = hist.getHistogram(image);
+        return cv::compareHist(refH, inputH, cv::HISTCMP_INTERSECT);
+    }
+};
+
+template<typename T, int N>
+class IntegralImage {
+    cv::Mat integralImage;
+public:
+    IntegralImage(cv::Mat image) {
+        // (costly) computation of the integral image
+        cv::integral(image, integralImage, cv::DataType<T>::type);
+    }
+
+    // compute sum over sub-regions of any size from 4 pixel accesses
+    cv::Vec<T, N> operator()(int xo, int yo, int width, int height) {
+        // window at (xo,yo) of size width by height
+        return (integralImage.at<cv::Vec<T, N>>(yo + height, xo + width)
+                - integralImage.at<cv::Vec<T, N>>(yo + height, xo)
+                - integralImage.at<cv::Vec<T, N>>(yo, xo + width)
+                + integralImage.at<cv::Vec<T, N>>(yo, xo));
+    }
+};
+
+void convertToBinaryPlanes(const cv::Mat &input, cv::Mat &output, int nPlanes) {
+    int n = 8 - static_cast<int>( log(static_cast<double>(nPlanes)) / log(2.0));
+    // mask used to eliminate least significant bits
+    uchar mask = 0xFF << n;
+    // create a vector of binary images
+    std::vector<cv::Mat> planes;
+    // reduce to nBins by eliminating least significant bits
+    cv::Mat reduced = input & mask;
+
+    // compute each binary image plane
+    planes.reserve(nPlanes);
+    for (int i = 0; i < nPlanes; i++) {
+        // 1 for each pixel equals to i<<shift
+        planes.push_back((reduced == (i << n)) & 0x1);
+    }
+    // create multi-channel image
+    cv::merge(planes, output);
+}
+
 int main() {
     // 1. Завантажити зображення
     Mat imageBW = imread(picPath, 0);
-    namedWindow("Original BW Image", WINDOW_AUTOSIZE);
-    imshow("Original BW Image", imageBW);
+//    namedWindow("Original BW Image", WINDOW_AUTOSIZE);
+//    imshow("Original BW Image", imageBW);
 
     Mat imageRGB = imread(picPath);
-    namedWindow("Original RGB Image", WINDOW_AUTOSIZE);
-    imshow("Original RGB Image", imageRGB);
+//    namedWindow("Original RGB Image", WINDOW_AUTOSIZE);
+//    imshow("Original RGB Image", imageRGB);
 
     // 2. Побудуйте зображення гістограми у вигляді графіка
     Histogram1D h;
@@ -281,11 +421,12 @@ int main() {
     // 9. За допомогою власної функції OpenCV для зворотного проектування
     // гістограми виявіть певний вміст кольорової версії зображення (наприклад,
     // область блакитного неба).
+    const Rect2i roiBack = cv::Rect(0, 0, 80, 90);
 
     ColorHistogram hc;
     hc.setSize(8); // (8 бiнiв на канал), 8x8x8
 
-    imageROI = imageRGB(cv::Rect(0, 22, 160, 160));
+    imageROI = imageRGB(roi);
     cv::Mat rgbHisto = hc.getHistogram(imageROI);
 
     ContentFinder finder;
@@ -297,32 +438,146 @@ int main() {
 //    imshow("Find RGB Image", result);
 
     // 10. Повторіть попередню вправу за допомогою обчислення розрідженої гістограми.
-
-    Mat eqImageROI;
-    equalizeHist(imageROI, eqImageROI);
-    Mat eqRgbHisto = hc.getHistogram(eqImageROI);
-
-    finder.setHistogram(eqRgbHisto);
+    SparseMat spRgbHisto = hc.getSparseHistogram(imageROI);
+    finder.setHistogram(spRgbHisto);
+    finder.setThreshold(0.05f);
     result = finder.find(imageRGB);
 
-    namedWindow("Find Eq RGB Image ROI", WINDOW_AUTOSIZE);
-    imshow("Find RGB Eq Image ROI", result);
+//    namedWindow("Find Sp RGB Image ROI", WINDOW_AUTOSIZE);
+//    imshow("Find Sp RGB Image ROI", result);
 
     // 11. Проведіть експерименти, вирішуючи попередні задачі із застосуванням
     // колірного простору HSV, L*a*b* або ін.
 
+    Mat hsvRgbHisto = hc.getHueHistogram(imageROI);
+    finder.setHistogram(hsvRgbHisto);
+    finder.setThreshold(0.05f);
+    result = finder.find(imageRGB);
+
+//    namedWindow("Find HSV Image ROI", WINDOW_AUTOSIZE);
+//    imshow("Find HSV Image ROI", result);
 
     // 12. Застосовуючи алгоритмом середнього зсуву, з початкової прямокутної області
     // (тобто положення особи людини на початковому зображенні), відтворіть прямий
     // об'єкт на місці обличчя нової людини на іншовому зображенні.
+    Mat image1 = imread(img1Path);
+    Rect image1RoiRect = Rect(100, 300, 40, 62);
+    Mat image1roi = image1(image1RoiRect);
+
+    cv::Mat image2 = cv::imread(img2Path);
+    cv::Mat image2hsv;
+    cv::cvtColor(image2, image2hsv, COLOR_BGR2HSV);
+
+    cv::Mat img1RoiColorHist = hc.getHueHistogram(image1roi, 10);
+    finder.setThreshold(0.0f);
+    finder.setHistogram(img1RoiColorHist);
+
+    int ch[1] = {0};
+    result = finder.find(image2hsv, 0.0f, 180.0f, ch);
+
+    // search objet with mean shift
+    Rect trackWindow = Rect(image1RoiRect);
+    cv::TermCriteria criteria(cv::TermCriteria::MAX_ITER,10000, 0.0001);
+    cv::meanShift(result, trackWindow, criteria);
+
+    cv::Mat imgResultSource = image1.clone();
+    rectangle(imgResultSource, image1RoiRect, Scalar(255, 0), 1);
+//    imshow("Source", imgResultSource);
+
+    cv::Mat imgResultSearched = image2.clone();
+    rectangle(imgResultSearched, trackWindow, Scalar(0, 0, 255), 2);
+//    imshow("Found", imgResultSearched);
 
     // 13. Застосувати поріг до зображення книги.
 
+    Mat imageBook = imread(bookPath);
+    cv::cvtColor(imageBook, imageBook, COLOR_BGR2GRAY);
+//    imshow("Original Book Image", imageBook);
+
+    Mat binaryFixed;
+    threshold(imageBook, binaryFixed, 70, 255, THRESH_BINARY);
+//    imshow("Fixed Threshold Book Image", binaryFixed);
+
     // 14. Отримати двійкове зображення книги, використовуючи адаптивний поріг.
+
+    Mat binaryAdaptive;
+//    integralThreshold(imageBook, binaryAdaptive);
+    cv::adaptiveThreshold(imageBook, binaryAdaptive, 255,
+                          cv::ADAPTIVE_THRESH_MEAN_C, cv::THRESH_BINARY,
+                          21, 0);
+//    namedWindow("Adaptive Threshold Book Image", WINDOW_AUTOSIZE);
+//    imshow("Adaptive Threshold Book Image", binaryAdaptive);
 
     // 15. Визначити розташування певного обєкту на зображенні, відстежуючи
     // його за допомогою гістограм.
 
     waitKey(0);
     return 0;
+}
+
+
+int main1() {
+    Mat result;
+    Mat hist;
+    Histogram1D h;
+    Histogram1D negative;
+    Mat hsv;
+
+    Mat image = imread(picPath);
+    Mat imageGrey = imread(picPath);
+    Mat imageBook = imread(bookPath);
+    Mat imageClone = image.clone();
+    Mat imageClone2 = image.clone();
+    Mat imageColor = image.clone();
+
+    colorReduce(image);
+    namedWindow("Image 1-5%", WINDOW_AUTOSIZE);
+    imshow("Image 1-5%", image);
+
+    Mat histo = h.getHistogram(image);
+    imshow("Histogram 1-5%", h.getHistogramImage(image));
+
+    Rect rect(330, 80, 230, 200);
+    Mat imageROI = imageClone(rect);
+    int minSat = 65;
+    ColorHistogram hc;
+    ContentFinder finder;
+    imageROI = imageColor(cv::Rect(330, 80, 230, 200));
+    cv::Mat shist = hc.getHistogram(imageROI);
+
+    namedWindow(" Imageroi", WINDOW_AUTOSIZE);
+    imshow(" Imageroi", imageROI);
+
+    for (int i = 0; i < 256; i++) {
+        cout << "Value " << i << " = " << histo.at<float>(i) << endl;
+    }
+
+    Mat lut(1, 256, CV_8U);
+    for (int i = 0; i < 256; i++) {
+        lut.at<uchar>(i) = 255 - i;
+    }
+
+    LUT(imageROI, lut, result);
+
+    imshow("HistogramNegative", negative.getHistogramImage(result));
+    imshow("negative image", result);
+
+    Mat binaryFixed;
+    threshold(imageBook, binaryFixed, 70, 255, THRESH_BINARY);
+    imshow("binaryFixed", binaryFixed);
+    Canny(imageBook, binaryFixed, 10, 100, 3);
+    namedWindow(" ImageBook", WINDOW_AUTOSIZE);
+    imshow(" ImageBook", binaryFixed);
+    Rect Rec(330, 80, 230, 200);
+
+    rectangle(imageClone2, Rec, Scalar(255), 1, 8, 0);
+    Mat Roi = imageClone2(Rec);
+    Rect WhereRec(0, 0, Roi.cols, Roi.rows);
+    Roi.copyTo(imageClone2(WhereRec));
+
+    imshow(" Final result", imageClone2);
+
+    waitKey(0);
+    return 0;
+
 }
