@@ -257,6 +257,10 @@ public:
         LUT(image, lookup, result);
         return result;
     }
+
+    void setSize(int size) {
+        histSize[0] = size;
+    }
 };
 
 class ImageComparator {
@@ -477,7 +481,7 @@ int main() {
 
     // search objet with mean shift
     Rect trackWindow = Rect(image1RoiRect);
-    cv::TermCriteria criteria(cv::TermCriteria::MAX_ITER,10000, 0.0001);
+    cv::TermCriteria criteria(cv::TermCriteria::MAX_ITER, 10000, 0.0001);
     cv::meanShift(result, trackWindow, criteria);
 
     cv::Mat imgResultSource = image1.clone();
@@ -511,73 +515,40 @@ int main() {
     // 15. Визначити розташування певного обєкту на зображенні, відстежуючи
     // його за допомогою гістограм.
 
-    waitKey(0);
-    return 0;
-}
+    Histogram1D h15;
+    h15.setSize(16);
 
+    const Rect area = image1RoiRect;
 
-int main1() {
-    Mat result;
-    Mat hist;
-    Histogram1D h;
-    Histogram1D negative;
-    Mat hsv;
+    // Обчислити гістограму зображення
+    cv::Mat refHistogram= h15.getHistogram(image1roi);
+    // Спочатку створити 16-плоский бінарний образ
+    cv::Mat planes;
+    convertToBinaryPlanes(image2,planes,16);
+    // Потім обчислити цілісне зображення
+    IntegralImage<float,16> intHistogram(planes);
 
-    Mat image = imread(picPath);
-    Mat imageGrey = imread(picPath);
-    Mat imageBook = imread(bookPath);
-    Mat imageClone = image.clone();
-    Mat imageClone2 = image.clone();
-    Mat imageColor = image.clone();
-
-    colorReduce(image);
-    namedWindow("Image 1-5%", WINDOW_AUTOSIZE);
-    imshow("Image 1-5%", image);
-
-    Mat histo = h.getHistogram(image);
-    imshow("Histogram 1-5%", h.getHistogramImage(image));
-
-    Rect rect(330, 80, 230, 200);
-    Mat imageROI = imageClone(rect);
-    int minSat = 65;
-    ColorHistogram hc;
-    ContentFinder finder;
-    imageROI = imageColor(cv::Rect(330, 80, 230, 200));
-    cv::Mat shist = hc.getHistogram(imageROI);
-
-    namedWindow(" Imageroi", WINDOW_AUTOSIZE);
-    imshow(" Imageroi", imageROI);
-
-    for (int i = 0; i < 256; i++) {
-        cout << "Value " << i << " = " << histo.at<float>(i) << endl;
+    double maxSimilarity = 0.0;
+    int xbest, ybest;
+    // Контур над горизонтальною смугою навколо розташування людини на початковому зображенні
+    for (int y = 110; y < 120; y++) {
+        for (int x = 0; x < image2.cols - area.width; x++) {
+            // Обчислити гістограму з 16 бiнів за допомогою цілісного зображення
+            auto histogram = intHistogram(x, y, area.width, area.height);
+            // Обчислити відстань від вихідної гістограми
+            double distance = cv::compareHist(refHistogram,histogram, HISTCMP_INTERSECT);
+            // Знаходимо положення найбільш подібної гістограми
+            if (distance > maxSimilarity) {
+                xbest = x;
+                ybest = y;
+                maxSimilarity = distance;
+            }
+        }
     }
-
-    Mat lut(1, 256, CV_8U);
-    for (int i = 0; i < 256; i++) {
-        lut.at<uchar>(i) = 255 - i;
-    }
-
-    LUT(imageROI, lut, result);
-
-    imshow("HistogramNegative", negative.getHistogramImage(result));
-    imshow("negative image", result);
-
-    Mat binaryFixed;
-    threshold(imageBook, binaryFixed, 70, 255, THRESH_BINARY);
-    imshow("binaryFixed", binaryFixed);
-    Canny(imageBook, binaryFixed, 10, 100, 3);
-    namedWindow(" ImageBook", WINDOW_AUTOSIZE);
-    imshow(" ImageBook", binaryFixed);
-    Rect Rec(330, 80, 230, 200);
-
-    rectangle(imageClone2, Rec, Scalar(255), 1, 8, 0);
-    Mat Roi = imageClone2(Rec);
-    Rect WhereRec(0, 0, Roi.cols, Roi.rows);
-    Roi.copyTo(imageClone2(WhereRec));
-
-    imshow(" Final result", imageClone2);
+    // намалюемо прямокутник у найкращому місці
+    cv::rectangle(image2,cv::Rect(xbest, ybest, area.width, area.height), 0);
+    imshow("Result", image2);
 
     waitKey(0);
     return 0;
-
 }
